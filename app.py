@@ -1,29 +1,20 @@
-import asyncio
 import os
-import queue
 import uuid
-from datetime import datetime
-from queue import Queue
+from typing import List, Dict
 
 import sounddevice as sd
 import streamlit as st
 from deepgram import DeepgramClientOptions, DeepgramClient, LiveTranscriptionEvents, LiveOptions
+from deepgram.utils import verboselogs
 from langchain_cohere import CohereEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_milvus import Milvus
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
 
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
 # Initialize session state
 if 'transcriptions' not in st.session_state:
     st.session_state["transcriptions"] = []
-if 'transcription_queue' not in st.session_state:
-    st.session_state["transcription_queue"] = queue.Queue()
-if 'configured' not in st.session_state:
-    st.session_state["configured"] = False
 
 # Configuration
 st.sidebar.header("Configuration")
@@ -35,7 +26,7 @@ zilliz_token = st.sidebar.text_input("Zilliz Token", type="password", value=os.g
 
 # Audio device selection
 devices = sd.query_devices()
-input_devices = [d['name'] for d in devices if d['max_input_channels'] > 0]
+input_devices = [f"{d['name']} ({d['max_input_channels']} in, {d['max_output_channels']} out)" for d in devices]
 selected_device = st.sidebar.selectbox("Select Audio Input Device", input_devices)
 
 # Language selection (example languages supported by Deepgram)
@@ -45,48 +36,33 @@ selected_language = st.sidebar.selectbox("Select Language", languages)
 # RAG configuration
 citation_limit = st.sidebar.number_input("Citation Limit", value=15)
 
-if st.sidebar.button("Configure"):
-    os.environ["DEEPGRAM_API_KEY"] = deepgram_api_key
-    os.environ["COHERE_API_KEY"] = cohere_api_key
-    os.environ["GOOGLE_API_KEY"] = google_api_key
-    st.session_state["configured"] = True
-    st.sidebar.success("Configured!")
-
 
 # Transcription handling
-async def transcribe_audio():
-    if "configured" not in st.session_state or not st.session_state["configured"]:
-        st.error("Please configure first.")
-        return
-
+def transcribe_audio():
     # Find the selected input device index
     device_idx = None
+    device_info = None
     for i, d in enumerate(devices):
-        if d['name'] == selected_device and d['max_input_channels'] > 0:
+        if f"{d['name']} ({d['max_input_channels']} in, {d['max_output_channels']} out)" == selected_device:
             device_idx = i
+            device_info = d
             break
 
     if device_idx is None:
         st.error("Selected audio device not found.")
         return
 
-    # Audio parameters
-    samplerate = 16000
-    channels = 1
+    # Use device's native parameters or fallback to defaults
     dtype = 'int16'
-
-    # Audio buffer
-    audio_queue = asyncio.Queue()
-
-    # Callback function for audio capture
-    def audio_callback(indata, frames, time, status):
-        if status:
-            print(f"Audio status: {status}")
-        audio_queue.put_nowait(bytes(indata))
+    chunk = 1024 * 8
+    samplerate = device_info['default_samplerate']
+    channels = device_info['max_input_channels']
+    if channels == 0:
+        channels = device_info['max_output_channels']
 
     # Initialize Deepgram client
-    config = DeepgramClientOptions(options={"keepalive": "true"})
-    dg = DeepgramClient(api_key=os.environ["DEEPGRAM_API_KEY"], config=config)
+    config = DeepgramClientOptions(verbose=verboselogs.DEBUG, options={"keepalive": "true"})
+    deepgram_client = DeepgramClient(api_key=deepgram_api_key, config=config)
 
     # Set up Deepgram parameters
     deepgram_options: LiveOptions = LiveOptions(
@@ -98,37 +74,55 @@ async def transcribe_audio():
         sample_rate=samplerate
     )
 
-    connection = dg.listen.asyncwebsocket.v("1")
+    connection = deepgram_client.listen.websocket.v("1")
 
-    async def on_message(self, result, **kwargs):
+    def on_message(self, result, **kwargs):
         alternatives = result.get("channel", {}).get("alternatives", [])
         if len(alternatives) > 0 and "words" in alternatives[0]:
-            for word in alternatives[0]["words"]:
-                transcription_queue: Queue = st.session_state["transcription_queue"]
-                transcription_queue.put({
-                    'text': word['word'],
-                    'timestamp': word.get('start', 0),
-                    'speaker': word.get('speaker', 0)
-                })
+            transcript = alternatives[0]["transcript"]
+            words = alternatives[0]["words"]
+            start = words[0]["start"] if words else None
+            end = words[-1]["end"] if words else None
+            speakers = [word['speaker'] for word in words]
+            transcription: Dict = {
+                'transcript': transcript,
+                'timestamp_start': start,
+                'timestamp_end': end,
+                'speakers': speakers
+            }
+            update_transcriptions(transcription)
+
+    def on_error(self, error, **kwargs):
+        print(f"Handled Error: {error}")
 
     connection.on(LiveTranscriptionEvents.Transcript, on_message)
+    connection.on(LiveTranscriptionEvents.Error, on_error)
 
-    await connection.start(options=deepgram_options)
+    connection.start(options=deepgram_options)
 
-    # Start the audio stream
+    def audio_callback(indata, frames, time, status):
+        if status:
+            print(f"Audio status: {status}")
+        audio_data = indata.tobytes()
+        connection.send(audio_data)
+
     stream = sd.InputStream(
         samplerate=samplerate,
         device=device_idx,
         channels=channels,
         callback=audio_callback,
-        dtype=dtype
+        dtype=dtype,
+        blocksize=chunk,
     )
     stream.start()
 
-    while True:
-        audio_data = await audio_queue.get()
-        await connection.send(audio_data)
-        await asyncio.sleep(0.1)
+
+if st.sidebar.button("Configure"):
+    os.environ["DEEPGRAM_API_KEY"] = deepgram_api_key
+    os.environ["COHERE_API_KEY"] = cohere_api_key
+    os.environ["GOOGLE_API_KEY"] = google_api_key
+    st.sidebar.success("Configured!")
+    transcribe_audio()
 
 
 # Ingestion pipeline with Langgraph
@@ -140,7 +134,7 @@ class IngestionState(BaseModel):
 
 def embed_chunk(state: IngestionState):
     embeddings = CohereEmbeddings(model="embed-english-v3.0")
-    state.embedding = embeddings.embed_documents([state.chunk['text']])[0]
+    state.embedding = embeddings.embed_documents([state.chunk['transcription']])[0]
     return state
 
 
@@ -152,9 +146,9 @@ def store_chunk(state: IngestionState):
     )
     state.vector_id = str(uuid.uuid4())
     vector_store.add_texts(
-        texts=[state.chunk['text']],
+        texts=[state.chunk['transcription']],
         embeddings=[state.embedding],
-        metadatas=[{'timestamp': state.chunk['timestamp'], 'speaker': state.chunk['speaker']}]
+        metadatas=[state.chunk]
     )
     return state
 
@@ -212,21 +206,6 @@ qna_graph.set_entry_point("embed_query")
 qna_graph.set_finish_point("generate")
 qna_app = qna_graph.compile()
 
-
-# Background processing
-def process_transcriptions():
-    while True:
-        try:
-            transcription_queue: Queue = st.session_state["transcription_queue"]
-            chunk = transcription_queue.get_nowait()
-            st.session_state["transcriptions"].append(chunk)
-            ingestion_state = IngestionState()
-            ingestion_state.chunk = chunk
-            ingestion_app.invoke(ingestion_state)
-        except queue.Empty:
-            break
-
-
 # Main Streamlit app
 st.title("transcriber-rag")
 
@@ -235,23 +214,17 @@ st.header("Transcription History")
 transcription_container = st.empty()
 
 
-async def update_transcriptions():
-    process_transcriptions()
+def update_transcriptions(transcription: Dict):
+    transcriptions: List[Dict] = st.session_state["transcriptions"]
+    transcriptions.append(transcription)
+    ingestion_state = IngestionState()
+    ingestion_state.chunk = transcription
+    ingestion_app.invoke(ingestion_state)
+
     with transcription_container:
-        for t in st.session_state["transcriptions"]:
-            st.write(f"[{datetime.fromtimestamp(t['timestamp'])}] Speaker {t['speaker']}: {t['text']}")
+        for transcription in transcriptions:
+            st.write(transcription)
 
-
-if st.session_state["configured"]:
-    if "transcribe_audio_task" in st.session_state and st.session_state["transcribe_audio_task"]:
-        st.session_state["transcribe_audio_task"].cancel()
-
-    st.session_state["transcribe_audio_task"] = loop.create_task(transcribe_audio())
-
-    if "update_transcription_task" in st.session_state and st.session_state["update_transcription_task"]:
-        st.session_state["update_transcription_task"].cancel()
-
-    st.session_state["update_transcription_task"] = loop.run_until_complete(update_transcriptions())
 
 # Q&A section
 st.header("Ask a Question")
