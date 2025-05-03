@@ -1,0 +1,21 @@
+[project]
+name = "transcriber-rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic",
+    "streamlit",
+    "sounddevice",
+    "deepgram-sdk",
+    "langchain_community",
+    "langchain",
+    "langgraph",
+    "langsmith",
+    "langchain-milvus",
+    "langchain-cohere",
+    "langchain-google-genai",
+    "pymilvus",
+    "nest_asyncio",
+]

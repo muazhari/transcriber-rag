@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: transcriber-rag
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic
+Requires-Dist: streamlit
+Requires-Dist: sounddevice
+Requires-Dist: deepgram-sdk
+Requires-Dist: langchain_community
+Requires-Dist: langchain
+Requires-Dist: langgraph
+Requires-Dist: langsmith
+Requires-Dist: langchain-milvus
+Requires-Dist: langchain-cohere
+Requires-Dist: langchain-google-genai
+Requires-Dist: pymilvus
+Requires-Dist: nest_asyncio
+
+# transcriber-rag
