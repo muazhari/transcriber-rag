@@ -6,7 +6,8 @@ Requires-Python: >=3.13
 Description-Content-Type: text/markdown
 Requires-Dist: pydantic
 Requires-Dist: streamlit
-Requires-Dist: sounddevice
+Requires-Dist: PyAudio
+Requires-Dist: PyAudioWPatch
 Requires-Dist: deepgram-sdk
 Requires-Dist: langchain_community
 Requires-Dist: langchain
@@ -19,3 +20,21 @@ Requires-Dist: pymilvus
 Requires-Dist: nest_asyncio
 
 # transcriber-rag
+
+> A simple speech transcriber with RAG application using Deepgram and LangChain.
+
+## Tutorial
+
+### 1. Install the dependencies.
+
+```bash
+uv pip install -e . -U
+```
+
+### 2. Apply configurations.
+
+### 3. Run the app.
+
+```bash
+streamlit run app.py
+```

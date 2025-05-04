@@ -1,6 +1,7 @@
 pydantic
 streamlit
-sounddevice
+PyAudio
+PyAudioWPatch
 deepgram-sdk
 langchain_community
 langchain

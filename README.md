@@ -17,3 +17,7 @@ uv pip install -e . -U
 ```bash
 streamlit run app.py
 ```
+
+## Demonstration
+
+![img-1.png](assets/img-1.png)
