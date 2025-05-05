@@ -1,7 +1,8 @@
 import asyncio
-import math
 import os
+import time
 import uuid
+from datetime import datetime, timezone
 from typing import List, Tuple
 
 import nest_asyncio
@@ -51,55 +52,59 @@ transcriptions: List[LiveResultResponse] = st.session_state["transcriptions"]
 st.sidebar.header("Configuration")
 deepgram_api_key = st.sidebar.text_input("Deepgram API Key", type="password", value=os.getenv("DEEPGRAM_API_KEY"))
 cohere_api_key = st.sidebar.text_input("Cohere API Key", type="password", value=os.getenv("COHERE_API_KEY"))
-google_api_key = st.sidebar.text_input("Google Gemini API Key", type="password", value=os.getenv("GOOGLE_API_KEY"))
+google_api_key = st.sidebar.text_input("Google API Key", type="password", value=os.getenv("GOOGLE_API_KEY"))
 zilliz_uri = st.sidebar.text_input("Zilliz URI", value=os.getenv("ZILLIZ_URI"))
 zilliz_token = st.sidebar.text_input("Zilliz Token", type="password", value=os.getenv("ZILLIZ_TOKEN"))
 
 devices = get_audio_devices()
 input_devices = [f"{device['name']} ({device['index']})" for device in devices]
-selected_device = st.sidebar.selectbox("Select Audio Input Device", input_devices)
+selected_device = st.sidebar.selectbox("Audio Device", input_devices)
 
-languages = ["en", "id"]
-selected_language = st.sidebar.selectbox("Select Language", languages)
-
+languages = ["en", "id", "multi"]
+selected_language = st.sidebar.selectbox("Language", languages)
+collection_name = st.sidebar.text_input("Collection Name", value="transcriber_rag")
+ingestion_batch_size = st.sidebar.number_input("Ingestion Batch Size", value=15)
 citation_limit = st.sidebar.number_input("Citation Limit", value=15)
 
-if "embedder" not in st.session_state:
-    embedder = CohereEmbeddings(
-        model="embed-v4.0",
-        cohere_api_key=cohere_api_key,
-    )
-    st.session_state["embedder"] = embedder
-
-embedder = st.session_state["embedder"]
-
-if "vector_store" not in st.session_state:
-    vector_store = Milvus(
-        embedding_function=embedder,
-        connection_args={"uri": zilliz_uri, "token": zilliz_token},
-        collection_name="transcriber_rag",
-        enable_dynamic_field=True,
-        index_params={"metric_type": "COSINE"},
-        search_params={"metric_type": "COSINE"},
-    )
-    st.session_state["vector_store"] = vector_store
-
-vector_store = st.session_state["vector_store"]
+embedder = CohereEmbeddings(
+    model="embed-v4.0",
+    cohere_api_key=cohere_api_key,
+)
+vector_store = Milvus(
+    embedding_function=embedder,
+    connection_args={"uri": zilliz_uri, "token": zilliz_token},
+    collection_name=collection_name,
+    enable_dynamic_field=True,
+    index_params={"metric_type": "COSINE"},
+    search_params={"metric_type": "COSINE"},
+)
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-pro-exp-03-25",
+    google_api_key=google_api_key,
+)
 
 st.title("transcriber-rag")
 status = st.empty()
 
 
 class IngestionState(BaseModel):
-    chunk: LiveResultResponse = None
+    chunks: List[LiveResultResponse] = None
 
 
 async def store_chunk(state: IngestionState):
     document = Document(
         id=uuid.uuid4(),
-        page_content=state.chunk.channel.alternatives[0].transcript,
-        metadata=state.chunk.to_dict()
+        page_content="",
+        metadata={
+            "timestamp": datetime.now(timezone.utc).astimezone().isoformat(),
+            "sources": [],
+        }
     )
+
+    for chunk in state.chunks:
+        transcript = chunk.channel.alternatives[0].transcript
+        document.page_content = f"{document.page_content} {transcript}"
+        document.metadata["sources"].append(chunk.to_dict())
 
     await vector_store.aadd_documents(
         ids=[document.id],
@@ -128,10 +133,6 @@ async def retrieve_documents(state: QNAState):
 
 
 async def generate_answer(state: QNAState):
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-pro-exp-03-25",
-        google_api_key=google_api_key,
-    )
     citations = []
     for index, (document, score) in enumerate(state.documents):
         citation = {
@@ -189,29 +190,6 @@ qna_graph.set_finish_point("generate")
 qna_app = qna_graph.compile()
 
 
-@st.dialog(title="Citation Details", width="large")
-def citation_details(document: Document):
-    st.write(document.model_dump())
-
-
-st.header("Ask a Question")
-question = st.text_area("Enter your question:")
-if st.button("Submit"):
-    qna_state = QNAState()
-    qna_state.query = question
-    result = loop.run_until_complete(qna_app.ainvoke(qna_state))
-    st.write("**Answer:**")
-    st.write(result["answer"])
-    st.write("**Citations:**")
-    for index, (document, score) in enumerate(result["documents"]):
-        if st.button(label=f"Citation {index + 1}: {score}"):
-            citation_details(document)
-        st.text(document.page_content)
-
-st.header("Transcriptions")
-transcription_container = st.empty()
-
-
 async def transcribe_audio():
     device_info = None
     for device in devices:
@@ -223,9 +201,8 @@ async def transcribe_audio():
         st.error("Selected audio device not found.")
         return
 
-    dtype = 'int16'
     format = pyaudio.paInt16
-    chunk = 1024 * 16
+    chunk = 1024 * 8
     sample_rate = int(device_info["defaultSampleRate"])
     channels = device_info["maxInputChannels"]
     config = DeepgramClientOptions(verbose=verboselogs.DEBUG, options={"keepalive": "true"})
@@ -234,7 +211,7 @@ async def transcribe_audio():
     deepgram_options: LiveOptions = LiveOptions(
         diarize=True,
         language=selected_language,
-        model="nova-3",
+        model="nova-3" if selected_language in ["multi", "en"] else "nova-2",
         no_delay=True,
         encoding="linear16",
         sample_rate=sample_rate,
@@ -244,22 +221,29 @@ async def transcribe_audio():
     connection = deepgram_client.listen.asyncwebsocket.v("1")
 
     async def on_message(self, result: LiveResultResponse, **kwargs):
-        if len(result.channel.alternatives) == 0:
-            return
-
-        if result.channel.alternatives[0].transcript == "":
+        if (
+                len(result.channel.alternatives) == 0
+                or result.is_final is False
+                or result.channel.alternatives[0].transcript == ""
+        ):
             return
 
         transcriptions.append(result)
-        ingestion_state = IngestionState()
-        ingestion_state.chunk = result
-        await ingestion_app.ainvoke(ingestion_state)
+
+        if len(transcriptions) % ingestion_batch_size == 0:
+            ingestion_state = IngestionState()
+            ingestion_state.chunks = transcriptions[-ingestion_batch_size:]
+            await ingestion_app.ainvoke(ingestion_state)
 
     async def on_error(self, error, **kwargs):
         print(f"Handled Error: {error}")
 
+    async def on_close(self, close, **kwargs):
+        print(f"Handled Close: {close}")
+
     connection.on(LiveTranscriptionEvents.Transcript, on_message)
     connection.on(LiveTranscriptionEvents.Error, on_error)
+    connection.on(LiveTranscriptionEvents.Close, on_close)
 
     await connection.start(options=deepgram_options)
 
@@ -291,50 +275,9 @@ def subtitle_time_formatter(seconds, separator):
     return f"{hours:02}:{minutes:02}:{secs:02}{separator}{millis:03}"
 
 
-async def update_transcriptions():
-    while True:
-        if st.session_state.get("stop", False):
-            break
-
-        with transcription_container:
-            subtitles = []
-            for index, transcription in enumerate(transcriptions):
-                start = transcription.start
-                end = start + transcription.duration
-                alternative = transcription.channel.alternatives[0]
-                words = alternative.words
-
-                # attaching speaker diarization below transcript words
-                transcript_words = []
-                transcript_speakers = []
-                for word in words:
-                    speaker = str(word.speaker)
-                    suffix = "   " * (int(math.fabs(len(word.punctuated_word) - len(speaker))))
-                    transcript_speaker = speaker if len(speaker) >= len(word.punctuated_word) else speaker + suffix
-                    transcript_speakers.append(transcript_speaker)
-                    if len(word["punctuated_word"]) >= len(speaker):
-                        transcript_word = word["punctuated_word"]
-                    else:
-                        transcript_word = word["punctuated_word"] + suffix
-                    transcript_words.append(transcript_word)
-
-                separator = "."
-                subtitle = (
-                    f"{index + 1}\n"
-                    f"{subtitle_time_formatter(start, separator)} - {subtitle_time_formatter(end, separator)}\n"
-                    f"{' '.join(transcript_words)}\n"
-                    f"{' '.join(transcript_speakers)}\n"
-                )
-                subtitles.insert(0, subtitle)
-
-            st.text("\n".join(subtitles))
-        await asyncio.sleep(1)
-
-
 if st.sidebar.button("Start", use_container_width=True):
     st.session_state["stop"] = False
     loop.run_until_complete(transcribe_audio())
-    loop.run_until_complete(update_transcriptions())
 
     with status:
         st.success("Started successfully!")
@@ -361,3 +304,83 @@ if st.sidebar.button("Reset", use_container_width=True):
 
     with status:
         st.success("Reset successfully!")
+
+
+def transcribe_page():
+    st.header("Transcribe")
+    transcription_container = st.empty()
+
+    while True:
+        if st.session_state.get("stop", True):
+            st.text("No transcriptions yet, please start it first.")
+            break
+
+        with transcription_container:
+            subtitles = []
+            for index, transcription in enumerate(transcriptions):
+                start = transcription.start
+                end = start + transcription.duration
+                alternative = transcription.channel.alternatives[0]
+                words = alternative.words
+
+                # attaching speaker diarization below transcript words
+                # Create aligned display of words and speakers using monospace formatting
+                transcript_text = ""
+                words_line = ""
+                speakers_line = ""
+
+                for i, word in enumerate(words):
+                    padding = max(len(word.punctuated_word), len(str(word.speaker)))
+                    formatted_word = f"{word.punctuated_word:<{padding}} "
+                    formatted_speaker = f"{str(word.speaker):<{padding}} "
+
+                    words_line += formatted_word
+                    speakers_line += formatted_speaker
+
+                transcript_text = f"{words_line}\n{speakers_line}"
+
+                separator = ","
+                subtitle = (
+                    f"{index + 1}\n"
+                    f"{subtitle_time_formatter(start, separator)} - {subtitle_time_formatter(end, separator)}\n"
+                    f"{transcript_text}\n"
+                )
+                subtitles.insert(0, subtitle)
+
+            # Use markdown with code block to ensure monospace font for alignment
+            st.markdown("```\n" + "\n".join(subtitles) + "\n```")
+        time.sleep(1)
+
+
+@st.dialog(title="Citation Details", width="large")
+def citation_details(document: Document):
+    st.write(document.model_dump())
+
+
+def qna_page():
+    st.header("Question Answering")
+    question = st.text_area("Enter your question:")
+    if st.button("Submit"):
+        qna_state = QNAState()
+        qna_state.query = question
+        result = loop.run_until_complete(qna_app.ainvoke(qna_state))
+        st.session_state["qna_result"] = result
+
+    if "qna_result" in st.session_state:
+        result = st.session_state["qna_result"]
+        st.write("**Answer:**")
+        st.write(result["answer"])
+        st.write("**Citations:**")
+        for index, (document, score) in enumerate(result["documents"]):
+            if st.button(label=f"Citation {index + 1}: {score}"):
+                citation_details(document)
+            st.text(document.page_content)
+
+
+pages = {
+    "Transcribe": transcribe_page,
+    "Question Answering": qna_page,
+}
+
+selected_page = st.sidebar.selectbox("Page", list(pages.keys()), index=0)
+pages[selected_page]()

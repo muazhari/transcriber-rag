@@ -1,6 +1,6 @@
 # transcriber-rag
 
-> A simple speech transcriber with RAG application using Deepgram and LangChain.
+> A simple voice transcriber with RAG application using Deepgram and LangChain.
 
 ## Tutorial
 
@@ -21,3 +21,4 @@ streamlit run app.py
 ## Demonstration
 
 ![img-1.png](assets/img-1.png)
+![img-2.png](assets/img-2.png)
