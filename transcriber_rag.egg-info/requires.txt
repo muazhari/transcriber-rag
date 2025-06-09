@@ -3,7 +3,7 @@ streamlit
 PyAudio
 PyAudioWPatch
 deepgram-sdk
-langchain_community
+langchain-community
 langchain
 langgraph
 langsmith
