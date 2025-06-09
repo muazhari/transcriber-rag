@@ -79,7 +79,7 @@ vector_store = Milvus(
     search_params={"metric_type": "COSINE"},
 )
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro-exp-03-25",
+    model="gemini-2.5-pro",
     google_api_key=google_api_key,
 )
 
@@ -325,7 +325,6 @@ def transcribe_page():
 
                 # attaching speaker diarization below transcript words
                 # Create aligned display of words and speakers using monospace formatting
-                transcript_text = ""
                 words_line = ""
                 speakers_line = ""
 
@@ -337,13 +336,12 @@ def transcribe_page():
                     words_line += formatted_word
                     speakers_line += formatted_speaker
 
-                transcript_text = f"{words_line}\n{speakers_line}"
-
                 separator = ","
                 subtitle = (
                     f"{index + 1}\n"
                     f"{subtitle_time_formatter(start, separator)} - {subtitle_time_formatter(end, separator)}\n"
-                    f"{transcript_text}\n"
+                    f"{words_line}\n"
+                    f"{speakers_line}\n"
                 )
                 subtitles.insert(0, subtitle)
 
@@ -359,10 +357,10 @@ def citation_details(document: Document):
 
 def qna_page():
     st.header("Question Answering")
-    question = st.text_area("Enter your question:")
+    query = st.text_area("Enter your query:")
     if st.button("Submit"):
         qna_state = QNAState()
-        qna_state.query = question
+        qna_state.query = query
         result = loop.run_until_complete(qna_app.ainvoke(qna_state))
         st.session_state["qna_result"] = result
 
