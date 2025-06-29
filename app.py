@@ -3,13 +3,13 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from multiprocessing import Process, Queue as MpQueue, Event
 from typing import List, Tuple
 
 import nest_asyncio
 import pyaudiowpatch as pyaudio
 import streamlit as st
-from deepgram import DeepgramClientOptions, DeepgramClient, LiveTranscriptionEvents, LiveOptions, LiveResultResponse, \
-    AsyncListenWebSocketClient
+from deepgram import DeepgramClientOptions, DeepgramClient, LiveTranscriptionEvents, LiveOptions, LiveResultResponse
 from deepgram.utils import verboselogs
 from langchain_cohere import CohereEmbeddings
 from langchain_core.documents import Document
@@ -190,6 +190,26 @@ qna_graph.set_finish_point("generate")
 qna_app = qna_graph.compile()
 
 
+def audio_recorder_process(q, stop, device_info_dict, chunk_size, audio_format, num_channels, sampling_rate):
+    audio_interface = pyaudio.PyAudio()
+    stream = audio_interface.open(
+        format=audio_format,
+        channels=num_channels,
+        rate=sampling_rate,
+        input=True,
+        input_device_index=device_info_dict["index"],
+        frames_per_buffer=chunk_size,
+    )
+
+    while not stop.is_set():
+        input_data = stream.read(chunk_size)
+        q.put(input_data)
+
+    stream.stop_stream()
+    stream.close()
+    audio_interface.terminate()
+
+
 async def transcribe_audio():
     device_info = None
     for device in devices:
@@ -247,24 +267,30 @@ async def transcribe_audio():
 
     await connection.start(options=deepgram_options)
 
-    def audio_callback(input_data, frames, time, status):
-        loop.run_until_complete(connection.send(input_data))
-        return (input_data, pyaudio.paContinue)
+    audio_queue = MpQueue()
+    stop_event = Event()
 
-    audio = pyaudio.PyAudio()
-    stream = audio.open(
-        format=format,
-        channels=channels,
-        rate=sample_rate,
-        input=True,
-        input_device_index=device_info["index"],
-        frames_per_buffer=chunk,
-        stream_callback=audio_callback,
+    recorder_process = Process(
+        target=audio_recorder_process,
+        args=(audio_queue, stop_event, device_info, chunk, format, channels, sample_rate)
     )
-    stream.start_stream()
+    recorder_process.start()
 
-    st.session_state["audio_stream"] = stream
-    st.session_state["deepgram_connection"] = connection
+    chunk_count = 0
+
+    while True:
+        if st.session_state.get("stop", True):
+            break
+
+        data = audio_queue.get()
+        await connection.send(data)
+        chunk_count += 1
+        print(f"Sent audio chunk {chunk_count} to Deepgram with length {len(data)} bytes")
+
+    await connection.close()
+
+    st.session_state["recorder_process"] = recorder_process
+    st.session_state["stop_event"] = stop_event
 
 
 def subtitle_time_formatter(seconds, separator):
@@ -284,13 +310,11 @@ if st.sidebar.button("Start", use_container_width=True):
 
 if st.sidebar.button("Stop", use_container_width=True):
     st.session_state["stop"] = True
-    if "audio_stream" in st.session_state:
-        audio_stream: pyaudio.Stream = st.session_state["audio_stream"]
-        audio_stream.stop_stream()
-
-    if "deepgram_connection" in st.session_state:
-        deepgram_connection: AsyncListenWebSocketClient = st.session_state["deepgram_connection"]
-        loop.run_until_complete(deepgram_connection.finish())
+    if "stop_event" in st.session_state:
+        st.session_state["stop_event"].set()
+    if "recorder_process" in st.session_state:
+        st.session_state["recorder_process"].join()
+        del st.session_state["recorder_process"]
 
     with status:
         st.success("Stopped successfully!")

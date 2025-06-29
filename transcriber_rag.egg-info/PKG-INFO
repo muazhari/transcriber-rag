@@ -7,7 +7,7 @@ Description-Content-Type: text/markdown
 Requires-Dist: pydantic
 Requires-Dist: streamlit
 Requires-Dist: PyAudio
-Requires-Dist: PyAudioWPatch
+Requires-Dist: pyaudiowpatch
 Requires-Dist: deepgram-sdk
 Requires-Dist: langchain-community
 Requires-Dist: langchain
