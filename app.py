@@ -3,7 +3,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from multiprocessing import Process, Queue as MpQueue, Event
+from threading import Thread, Event
 from typing import List, Tuple
 
 import nest_asyncio
@@ -27,6 +27,13 @@ if "event_loop" not in st.session_state:
 
 loop = st.session_state["event_loop"]
 asyncio.set_event_loop(loop)
+
+if "stop_event" not in st.session_state:
+    stop_event = Event()
+    stop_event.set()
+    st.session_state["stop_event"] = stop_event
+
+stop_event = st.session_state["stop_event"]
 
 
 def get_audio_devices():
@@ -190,27 +197,7 @@ qna_graph.set_finish_point("generate")
 qna_app = qna_graph.compile()
 
 
-def audio_recorder_process(q, stop, device_info_dict, chunk_size, audio_format, num_channels, sampling_rate):
-    audio_interface = pyaudio.PyAudio()
-    stream = audio_interface.open(
-        format=audio_format,
-        channels=num_channels,
-        rate=sampling_rate,
-        input=True,
-        input_device_index=device_info_dict["index"],
-        frames_per_buffer=chunk_size,
-    )
-
-    while not stop.is_set():
-        input_data = stream.read(chunk_size)
-        q.put(input_data)
-
-    stream.stop_stream()
-    stream.close()
-    audio_interface.terminate()
-
-
-async def transcribe_audio():
+def transcribe_audio():
     device_info = None
     for device in devices:
         if selected_device == f"{device['name']} ({device['index']})":
@@ -225,10 +212,10 @@ async def transcribe_audio():
     chunk = 1024 * 8
     sample_rate = int(device_info["defaultSampleRate"])
     channels = device_info["maxInputChannels"]
-    config = DeepgramClientOptions(verbose=verboselogs.DEBUG, options={"keepalive": "true"})
-    deepgram_client = DeepgramClient(api_key=deepgram_api_key, config=config)
+    deepgram_config = DeepgramClientOptions(verbose=verboselogs.DEBUG, options={"keepalive": "true"})
+    deepgram_client = DeepgramClient(api_key=deepgram_api_key, config=deepgram_config)
 
-    deepgram_options: LiveOptions = LiveOptions(
+    deepgram_live_options: LiveOptions = LiveOptions(
         diarize=True,
         language=selected_language,
         model="nova-3" if selected_language in ["multi", "en"] else "nova-2",
@@ -237,10 +224,9 @@ async def transcribe_audio():
         sample_rate=sample_rate,
         smart_format=True,
     )
+    deepgram_connection = deepgram_client.listen.websocket.v("1")
 
-    connection = deepgram_client.listen.asyncwebsocket.v("1")
-
-    async def on_message(self, result: LiveResultResponse, **kwargs):
+    def on_transcript(self, result: LiveResultResponse, *args, **kwargs):
         if (
                 len(result.channel.alternatives) == 0
                 or result.is_final is False
@@ -253,44 +239,47 @@ async def transcribe_audio():
         if len(transcriptions) % ingestion_batch_size == 0:
             ingestion_state = IngestionState()
             ingestion_state.chunks = transcriptions[-ingestion_batch_size:]
-            await ingestion_app.ainvoke(ingestion_state)
+            ingestion_app.invoke(ingestion_state)
 
-    async def on_error(self, error, **kwargs):
+    def on_error(self, error, *args, **kwargs):
         print(f"Handled Error: {error}")
 
-    async def on_close(self, close, **kwargs):
+    def on_close(self, close, *args, **kwargs):
         print(f"Handled Close: {close}")
 
-    connection.on(LiveTranscriptionEvents.Transcript, on_message)
-    connection.on(LiveTranscriptionEvents.Error, on_error)
-    connection.on(LiveTranscriptionEvents.Close, on_close)
+    deepgram_connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
+    deepgram_connection.on(LiveTranscriptionEvents.Error, on_error)
+    deepgram_connection.on(LiveTranscriptionEvents.Close, on_close)
+    deepgram_connection.start(options=deepgram_live_options)
 
-    await connection.start(options=deepgram_options)
-
-    audio_queue = MpQueue()
-    stop_event = Event()
-
-    recorder_process = Process(
-        target=audio_recorder_process,
-        args=(audio_queue, stop_event, device_info, chunk, format, channels, sample_rate)
+    audio = pyaudio.PyAudio()
+    audio_stream = audio.open(
+        format=format,
+        channels=channels,
+        rate=sample_rate,
+        input=True,
+        input_device_index=device_info["index"],
+        frames_per_buffer=chunk,
     )
-    recorder_process.start()
 
     chunk_count = 0
 
+    print(f"Starting audio stream with device: {device_info['name']} ({device_info['index']})")
     while True:
-        if st.session_state.get("stop", True):
+        if stop_event.is_set():
             break
 
-        data = audio_queue.get()
-        await connection.send(data)
+        print("Reading audio chunk...")
+        audio_data = audio_stream.read(chunk)
+        print(f"Read audio chunk of length {len(audio_data)} bytes")
+        deepgram_connection.send(audio_data)
         chunk_count += 1
-        print(f"Sent audio chunk {chunk_count} to Deepgram with length {len(data)} bytes")
+        print(f"Sent audio chunk {chunk_count} to Deepgram with length {len(audio_data)} bytes")
 
-    await connection.close()
-
-    st.session_state["recorder_process"] = recorder_process
-    st.session_state["stop_event"] = stop_event
+    deepgram_connection.finish()
+    audio_stream.stop_stream()
+    audio_stream.close()
+    audio.terminate()
 
 
 def subtitle_time_formatter(seconds, separator):
@@ -302,19 +291,20 @@ def subtitle_time_formatter(seconds, separator):
 
 
 if st.sidebar.button("Start", use_container_width=True):
-    st.session_state["stop"] = False
-    loop.run_until_complete(transcribe_audio())
+    stop_event.clear()
+    transcription_thread = Thread(target=transcribe_audio)
+    transcription_thread.start()
+    st.session_state["transcription_thread"] = transcription_thread
 
     with status:
         st.success("Started successfully!")
 
 if st.sidebar.button("Stop", use_container_width=True):
-    st.session_state["stop"] = True
-    if "stop_event" in st.session_state:
-        st.session_state["stop_event"].set()
-    if "recorder_process" in st.session_state:
-        st.session_state["recorder_process"].join()
-        del st.session_state["recorder_process"]
+    stop_event.set()
+
+    if "transcription_thread" in st.session_state:
+        transcription_thread: Thread = st.session_state["transcription_thread"]
+        transcription_thread.join()
 
     with status:
         st.success("Stopped successfully!")
@@ -333,14 +323,14 @@ if st.sidebar.button("Reset", use_container_width=True):
 def transcribe_page():
     st.header("Transcribe")
     transcription_container = st.empty()
+    subtitles = []
 
     while True:
-        if st.session_state.get("stop", True):
+        if stop_event.is_set() or len(subtitles) == 0:
             st.text("No transcriptions yet, please start it first.")
             break
 
         with transcription_container:
-            subtitles = []
             for index, transcription in enumerate(transcriptions):
                 start = transcription.start
                 end = start + transcription.duration
@@ -371,7 +361,8 @@ def transcribe_page():
 
             # Use markdown with code block to ensure monospace font for alignment
             st.markdown("```\n" + "\n".join(subtitles) + "\n```")
-        time.sleep(1)
+
+        time.sleep(0.5)
 
 
 @st.dialog(title="Citation Details", width="large")
