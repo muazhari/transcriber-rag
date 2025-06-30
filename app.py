@@ -98,9 +98,9 @@ class IngestionState(BaseModel):
     chunks: List[LiveResultResponse] = None
 
 
-async def store_chunk(state: IngestionState):
+def store_chunk(state: IngestionState):
     document = Document(
-        id=uuid.uuid4(),
+        id=str(uuid.uuid4()),
         page_content="",
         metadata={
             "timestamp": datetime.now(timezone.utc).astimezone().isoformat(),
@@ -113,7 +113,7 @@ async def store_chunk(state: IngestionState):
         document.page_content = f"{document.page_content} {transcript}"
         document.metadata["sources"].append(chunk.to_dict())
 
-    await vector_store.aadd_documents(
+    vector_store.add_documents(
         ids=[document.id],
         documents=[document]
     )
@@ -134,12 +134,12 @@ class QNAState(BaseModel):
     answer: str = None
 
 
-async def retrieve_documents(state: QNAState):
-    state.documents = await vector_store.asimilarity_search_with_score(query=state.query, k=citation_limit)
+def retrieve_documents(state: QNAState):
+    state.documents = vector_store.similarity_search_with_score(query=state.query, k=citation_limit)
     return state
 
 
-async def generate_answer(state: QNAState):
+def generate_answer(state: QNAState):
     citations = []
     for index, (document, score) in enumerate(state.documents):
         citation = {
@@ -183,7 +183,7 @@ async def generate_answer(state: QNAState):
         },
     ]
     message = HumanMessage(content=message_content)
-    response = await llm.ainvoke([message])
+    response = llm.invoke([message])
     state.answer = response.content
     return state
 
@@ -209,9 +209,9 @@ def transcribe_audio():
         return
 
     format = pyaudio.paInt16
-    chunk = 1024 * 8
-    sample_rate = int(device_info["defaultSampleRate"])
-    channels = device_info["maxInputChannels"]
+    chunk = 8000
+    sample_rate = 48000
+    channels = 1
     deepgram_config = DeepgramClientOptions(verbose=verboselogs.DEBUG, options={"keepalive": "true"})
     deepgram_client = DeepgramClient(api_key=deepgram_api_key, config=deepgram_config)
 
@@ -323,14 +323,15 @@ if st.sidebar.button("Reset", use_container_width=True):
 def transcribe_page():
     st.header("Transcribe")
     transcription_container = st.empty()
-    subtitles = []
 
     while True:
-        if stop_event.is_set() or len(subtitles) == 0:
+        if stop_event.is_set():
             st.text("No transcriptions yet, please start it first.")
             break
 
         with transcription_container:
+            subtitles = []
+
             for index, transcription in enumerate(transcriptions):
                 start = transcription.start
                 end = start + transcription.duration
@@ -359,8 +360,11 @@ def transcribe_page():
                 )
                 subtitles.insert(0, subtitle)
 
-            # Use markdown with code block to ensure monospace font for alignment
-            st.markdown("```\n" + "\n".join(subtitles) + "\n```")
+            if len(subtitles) == 0:
+                st.spinner("Waiting for transcriptions...")
+            else:
+                # Use markdown with code block to ensure monospace font for alignment
+                st.markdown("```\n" + "\n".join(subtitles) + "\n```")
 
         time.sleep(0.5)
 
