@@ -86,7 +86,7 @@ vector_store = Milvus(
     search_params={"metric_type": "COSINE"},
 )
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro",
+    model="gemini-2.5-flash",
     google_api_key=google_api_key,
 )
 
@@ -264,14 +264,11 @@ def transcribe_audio():
 
     chunk_count = 0
 
-    print(f"Starting audio stream with device: {device_info['name']} ({device_info['index']})")
     while True:
         if stop_event.is_set():
             break
 
-        print("Reading audio chunk...")
         audio_data = audio_stream.read(chunk)
-        print(f"Read audio chunk of length {len(audio_data)} bytes")
         deepgram_connection.send(audio_data)
         chunk_count += 1
         print(f"Sent audio chunk {chunk_count} to Deepgram with length {len(audio_data)} bytes")
