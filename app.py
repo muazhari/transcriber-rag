@@ -38,15 +38,11 @@ stop_event = st.session_state["stop_event"]
 
 def get_audio_devices():
     p = pyaudio.PyAudio()
-    info = p.get_host_api_info_by_index(0)
     devices = []
 
-    for loopback in p.get_loopback_device_info_generator():
-        devices.append(loopback)
-
-    for i in range(0, info.get('deviceCount')):
-        if (p.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
-            devices.append(p.get_device_info_by_host_api_device_index(0, i))
+    for device in p.get_device_info_generator():
+        if device["maxInputChannels"] > 0:
+            devices.append(device)
 
     return devices
 
@@ -220,9 +216,10 @@ async def transcribe_audio():
         language=selected_language,
         model="nova-3" if selected_language in ["multi", "en"] else "nova-2",
         no_delay=True,
+        smart_format=True,
         encoding="linear16",
         sample_rate=sample_rate,
-        smart_format=True,
+        channels=channels,
     )
     deepgram_connection = deepgram_client.listen.asyncwebsocket.v("1")
 
