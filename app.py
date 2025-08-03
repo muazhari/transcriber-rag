@@ -2,6 +2,7 @@ import asyncio
 import os
 import time
 import uuid
+from asyncio import AbstractEventLoop
 from datetime import datetime, timezone
 from threading import Event
 from typing import List, Tuple
@@ -19,14 +20,12 @@ from langchain_milvus import Milvus
 from langgraph.graph import StateGraph
 from pydantic import BaseModel
 
-nest_asyncio.apply()
-
 if "event_loop" not in st.session_state:
-    loop = asyncio.new_event_loop()
-    st.session_state["event_loop"] = loop
+    st.session_state["event_loop"] = asyncio.new_event_loop()
 
-loop = st.session_state["event_loop"]
+loop: AbstractEventLoop = st.session_state["event_loop"]
 asyncio.set_event_loop(loop)
+nest_asyncio.apply()
 
 if "stop_event" not in st.session_state:
     stop_event = Event()
